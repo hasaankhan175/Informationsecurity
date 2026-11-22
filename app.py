@@ -2,14 +2,16 @@
 Password Security Analyzer - Group E (Information Security, BS Data Science)
 
 How the file is organised:
-  1. Settings & data : common-password list, constants.
+  1. Settings & data : leaked-password dataset loader (CSV), constants.
   2. Logic functions : pool_size, find_patterns, format_time, analyze, check_breach, generators.
   3. User interface  : five tabs (Analyzer, Generator, Hashing Demo, Brute-Force Simulation, About).
 Run with:  streamlit run app.py
 """
+import csv
 import hashlib
 import itertools
 import math
+import os
 import re
 import secrets
 import string
@@ -33,14 +35,54 @@ MESSAGES = {
     "Very Weak": "This password is very weak. Do not use it.",
 }
 
-# Small list of very common passwords (a real tool would use millions of entries)
-COMMON = {
-    "password", "123456", "12345678", "123456789", "qwerty", "abc123", "111111", "123123",
-    "admin", "letmein", "welcome", "monkey", "dragon", "iloveyou", "sunshine", "princess",
-    "football", "baseball", "login", "master", "hello", "freedom", "whatever", "trustno1",
-    "passw0rd", "password1", "1234567890", "000000", "qwerty123", "superman", "batman",
-    "shadow", "michael", "pakistan", "karachi", "ali123", "ahmed123", "zaq12wsx", "1q2w3e4r",
-}
+# ---- Leaked-password dataset -------------------------------------------------
+# CSV file with two columns: rank, password (ordered from most common to least common).
+# Keep it in the same folder as app.py.
+DATASET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "10millionPasswords.csv")
+
+# How many of the top-ranked passwords to load into memory.
+# 1,000,000 needs roughly 150-200 MB RAM. All 10,000,000 needs well over 1 GB,
+# so raise this number only if your computer/server has enough memory.
+MAX_PASSWORDS = 1_000_000
+
+# Tiny emergency list, used ONLY if the dataset file cannot be found
+FALLBACK = ["123456", "password", "12345678", "qwerty", "123456789",
+            "12345", "1234", "111111", "1234567", "dragon"]
+
+
+@st.cache_resource(show_spinner="Loading password dataset...")
+def load_dataset(path: str, limit: int) -> dict:
+    """
+    Read the CSV once and keep it in memory as a dictionary {password: rank}.
+    - st.cache_resource means this runs only once, not on every click.
+    - A dictionary lets us check "is this password in the list?" instantly.
+    - Python dictionaries remember insertion order, so looping over it gives the passwords
+      from most common (rank 1) to least common. The dictionary attack uses that order.
+    - Rows whose first column is not a number (the header row) are skipped.
+    - Returns an empty dictionary if the file does not exist.
+    """
+    ranks = {}
+    try:
+        with open(path, newline="", encoding="utf-8-sig", errors="ignore") as f:
+            for row in csv.reader(f):
+                if len(row) < 2 or not row[1]:
+                    continue
+                try:
+                    rank = int(row[0].strip())
+                except ValueError:
+                    continue  # header row such as: rank,password
+                ranks.setdefault(row[1], rank)
+                if len(ranks) >= limit:
+                    break
+    except OSError:
+        return {}
+    return ranks
+
+
+PASSWORD_RANKS = load_dataset(DATASET_FILE, MAX_PASSWORDS)
+USING_DATASET = bool(PASSWORD_RANKS)
+if not USING_DATASET:
+    PASSWORD_RANKS = {pw: i + 1 for i, pw in enumerate(FALLBACK)}
 
 # Sequences that attackers try early (checked forwards and backwards)
 SEQUENCES = ["abcdefghijklmnopqrstuvwxyz", "qwertyuiop", "asdfghjkl", "zxcvbnm", "0123456789"]
@@ -80,13 +122,29 @@ def pool_size(pw: str) -> int:
     return size
 
 
+def common_rank(pw: str):
+    """
+    Look the password up in the dataset and return its rank (1 = most common),
+    or None if it is not in the dataset. Three versions are tried:
+      1. exactly as typed            (Password1)
+      2. lowercase                   (password1)
+      3. lowercase with l33t undone  (p@ssw0rd -> password)
+    """
+    low = pw.lower()
+    for candidate in (pw, low, low.translate(LEET)):
+        rank = PASSWORD_RANKS.get(candidate)
+        if rank is not None:
+            return rank
+    return None
+
+
 def find_patterns(pw: str):
     """
     Look for habits that attackers guess first and return a list of problems:
       - keyboard/alphabet/number sequences of 4+ characters (qwer, abcd, 1234, also reversed)
       - 3 or more identical characters in a row (aaa, 111)
       - years such as 1999 or 2024
-      - common passwords, even when disguised with l33t substitutions (p@ssw0rd)
+      - passwords found in the leaked-password dataset, even with l33t substitutions (p@ssw0rd)
     Each problem found later reduces the entropy score in analyze().
     """
     found = []
@@ -99,8 +157,9 @@ def find_patterns(pw: str):
         found.append("Contains repeated characters (for example 'aaa' or '111')")
     if re.search(r"(19|20)\d{2}", pw):
         found.append("Contains a year, which is an easy guess")
-    if low in COMMON or low.translate(LEET) in COMMON:
-        found.append("Is a common password (even with letter-to-symbol substitutions)")
+    rank = common_rank(pw)
+    if rank is not None:
+        found.append(f"Found in the leaked-password dataset (rank #{rank:,})")
     return found
 
 
@@ -130,7 +189,7 @@ def analyze(pw: str) -> dict:
     Steps:
       1. entropy = length x log2(pool size)  -> theoretical bits of randomness
       2. subtract 10 bits for every pattern found (the password is more predictable)
-      3. common passwords are capped at 8 bits (they are cracked instantly from wordlists)
+      3. passwords found in the dataset are capped at 8 bits (they are cracked instantly from wordlists)
       4. score = entropy / 80 x 100 (80 bits is treated as 'excellent'), with extra caps for
          short passwords (<8 chars max 25) and for anything under 12 chars (never 'Very Strong')
       5. crack time = 2^entropy / 2 / guesses per second (average case: half the space)
@@ -139,7 +198,8 @@ def analyze(pw: str) -> dict:
     size = pool_size(pw)
     raw_entropy = length * math.log2(size) if size else 0
     patterns = find_patterns(pw)
-    is_common = pw.lower() in COMMON or pw.lower().translate(LEET) in COMMON
+    rank = common_rank(pw)
+    is_common = rank is not None
 
     entropy = max(0.0, raw_entropy - 10 * len(patterns))
     if is_common:
@@ -172,7 +232,7 @@ def analyze(pw: str) -> dict:
     }
     crack_seconds = (2 ** entropy) / GUESSES_PER_SEC / 2
     return dict(length=length, entropy=entropy, score=score, level=level, checks=checks,
-                patterns=patterns, crack_time=format_time(crack_seconds))
+                patterns=patterns, crack_time=format_time(crack_seconds), rank=rank)
 
 
 def check_breach(pw: str):
@@ -234,6 +294,11 @@ def generate_passphrase(n=4):
 # ---------------------------------------------------------------------------
 st.title("🔐 Password Security Analyzer")
 st.caption("Information Security project · Group E · Passwords are never stored or logged.")
+if USING_DATASET:
+    st.caption(f"Leaked-password dataset loaded: {len(PASSWORD_RANKS):,} passwords.")
+else:
+    st.warning("Dataset file '10millionPasswords.csv' was not found next to app.py. "
+               "Using a tiny built-in list instead.")
 
 tab_an, tab_gen, tab_hash, tab_bf, tab_about = st.tabs(
     ["Analyzer", "Generator", "Hashing Demo", "Brute-Force Simulation", "About"])
@@ -365,16 +430,26 @@ with tab_bf:
             st.code(target_hash.hex(), language=None)
 
             if mode == "Dictionary attack":
+                # Try the dataset from the most common password to the least common one,
+                # hashing each guess and comparing it with the target hash.
+                total = len(PASSWORD_RANKS)
+                st.write(f"Wordlist: **{total:,}** passwords, tried from most to least common.")
+                bar = st.progress(0.0, text="Running...")
                 start, found, attempts = time.time(), None, 0
-                for guess in sorted(COMMON):
+                for guess, rank in PASSWORD_RANKS.items():
                     attempts += 1
                     if hashlib.sha256(guess.encode()).digest() == target_hash:
-                        found = guess
+                        found = (guess, rank)
                         break
+                    if attempts % 50_000 == 0:
+                        bar.progress(attempts / total, text=f"{attempts:,} guesses...")
+                bar.progress(1.0, text="Finished")
+                elapsed = time.time() - start
                 if found:
-                    st.error(f"Cracked: '{found}' after {attempts} guesses in {time.time() - start:.4f} seconds.")
+                    st.error(f"Cracked: '{found[0]}' (rank #{found[1]:,} in the dataset) after "
+                             f"{attempts:,} guesses in {elapsed:.3f} seconds.")
                 else:
-                    st.success(f"Not found in the list of {attempts} common passwords.")
+                    st.success(f"Not found in the {attempts:,} passwords of the dataset ({elapsed:.1f} seconds).")
             else:
                 charset = charsets[cs_name]
                 if len(target) > max_len or any(ch not in charset for ch in target):
@@ -427,7 +502,7 @@ demonstrates hashing and attacks.
 
 ### Main features
 1. Password Strength Checker
-2. Common Password Detector
+2. Common Password Detector (leaked-password dataset)
 3. Password Entropy Analyzer
 4. Secure Password Generator
 5. Password Hashing Demonstration (hashlib and bcrypt)
@@ -436,7 +511,7 @@ demonstrates hashing and attacks.
 ### How the analyzer works
 1. **Character pool:** lowercase 26, uppercase 26, digits 10, symbols about 33.
 2. **Entropy:** `Entropy = Length × log2(Pool size)` bits. More bits means exponentially more guesses.
-3. **Pattern penalties:** sequences (`qwerty`, `1234`), repeats (`aaa`), years and common passwords
+3. **Pattern penalties:** sequences (`qwerty`, `1234`), repeats (`aaa`), years and leaked passwords from the dataset
    (including `p@ssw0rd`) reduce the entropy.
 4. **Crack time:** `2^entropy / 2 / guesses per second`, using 10 billion guesses per second.
 5. **Score and level:** entropy is mapped to 0–100 and five levels: Very Weak, Weak, Medium, Strong, Very Strong.
@@ -445,18 +520,18 @@ demonstrates hashing and attacks.
 
 ### Security concepts demonstrated
 - Password entropy and brute-force attacks
-- Dictionary attacks and common-password lists
+- Dictionary attacks using a leaked-password dataset
 - Hashing, salting, and slow adaptive hashing with bcrypt
 - k-anonymity for privacy-preserving breach lookups
 - Cryptographically secure random generation (`secrets`)
 - No storage or logging of passwords
 
 ### Technologies
-Python 3 · Streamlit · hashlib · bcrypt · Requests · secrets
+Python 3 · Streamlit · hashlib · bcrypt · Requests · secrets · csv
 
 ### Limitations
 - Crack times are estimates; real attackers use smarter rules and larger wordlists.
-- The common-password list is small.
+- Only the top-ranked passwords of the dataset are loaded (see `MAX_PASSWORDS` in the code).
 - Do not type real, important passwords into any website you do not control.
 
 ### Team members
