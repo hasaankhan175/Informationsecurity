@@ -43,7 +43,7 @@ DATASET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "10milli
 # How many of the top-ranked passwords to load into memory.
 # 1,000,000 needs roughly 150-200 MB RAM. All 10,000,000 needs well over 1 GB,
 # so raise this number only if your computer/server has enough memory.
-MAX_PASSWORDS = 1_000_000
+MAX_PASSWORDS = 10_000_000
 
 # Tiny emergency list, used ONLY if the dataset file cannot be found
 FALLBACK = ["123456", "password", "12345678", "qwerty", "123456789",
